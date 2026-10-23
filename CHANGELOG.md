@@ -9,7 +9,7 @@ release notes.
 ## [Unreleased]
 
 ### Added
-- pi, a second coding agent for your own model server or any provider: add endpoints with `msbctl setup` → Model endpoints (HTTPS only, the key stays on the host), then tick `pi` under Coding agents and rebuild.
+- pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
 
 ## [0.7.0] - 2026-10-22
 

@@ -24,16 +24,28 @@ Two things set it up:
    machine-local: `[defaults] llm`, or `llm` in the sandbox's registry entry
    (`msbctl edit` → "Models for pi").
 
-Then rebuild and run `pi` inside, or `msbctl exec . -- pi -p "…"`. The first
-endpoint is pi's default; `/model` (or Ctrl+L) switches between them.
+Then rebuild and run `pi` inside, or `msbctl exec . -- pi -p "…" </dev/null`
+(without a terminal, `pi -p` waits for its input to close). The first
+endpoint's model is pi's default; `/model` (or Ctrl+L) switches between
+everything the endpoints serve.
 
 ## Your own server
+
+"Add a model source" → "your own server" asks for its URL, in whatever form
+(`gufo.example`, `https://gufo.example/v1/`), and its key, which is optional.
+msbctl then asks the server what it is, from this machine: `/v1/models` and
+`/models` in the OpenAI style (vLLM, llama.cpp, Ollama, LM Studio and LiteLLM
+all answer it), then Anthropic's. Whatever answers decides the base URL, with
+or without `/v1`, and the API. If the certificate isn't trusted it asks for the
+CA that signed it, if the name resolves to a LAN address it sets
+`private_dns`, and then you pick the model from the list the server sent back.
+The result:
 
 ```toml
 [llm.qwen]
 base_url = "https://llm.home.example:8443/v1"
-models = ["Qwen3-Coder-Next"]
-context_window = 131072
+api = "openai-completions"
+default_model = "Qwen3-Coder-Next"
 private_dns = true
 ca_cert = "/home/you/.config/msb/home-ca.pem"
 ```
@@ -57,11 +69,12 @@ From that one table, msbctl derives everything the sandbox needs:
 | pi's config | `~/.pi/agent/models.json` and `settings.json`, written on every start |
 
 Egress, TLS and the key binding are fixed at create time. Changing an
-endpoint, or which endpoints a sandbox gets, needs a rebuild. Its models and
-pi's settings are rewritten on every start.
+endpoint's host or port, or which endpoints a sandbox gets, needs a rebuild.
+The model and pi's settings are rewritten on every start.
 
 The other keys: `api` (`openai-completions` by default; also
-`openai-responses`, `anthropic-messages`, `google-generative-ai`), `max_tokens`,
+`openai-responses`, `anthropic-messages`, `google-generative-ai`),
+`context_window` (overrides what the server reports), `max_tokens`,
 `reasoning`, and `compat`, which is handed to pi as it is (see pi's
 `docs/models.md`). For `openai-completions` msbctl sets pi's
 `supportsDeveloperRole` and `supportsReasoningEffort` to false, because vLLM,
@@ -72,12 +85,30 @@ llama.cpp and Ollama need that. For a Qwen model on vLLM that thinks,
 > pick the matching `--tool-call-parser`; on llama.cpp start it with `--jinja`.
 > Serve at least 64k of context: pi's system prompt and tools come first.
 
+## Choosing and changing the model
+
+The models a server offers change whenever you load or unload one, so msbctl
+doesn't keep a list of them. Every start of a sandbox with pi asks each of
+your servers what it serves at that moment, and that is what pi's `/model`
+offers. If a server can't be reached, the last list it sent is used.
+
+`default_model` is the one pi starts with. When a server stops serving it, the
+start says so, pi starts with the first model that is served, and `msbctl
+setup` → "Model endpoints" marks the endpoint. "Choose a model" there offers
+the server's current list (narrowed by a filter when it's long, as
+OpenRouter's is), or an id typed by hand. The change applies from the
+sandbox's next start, without a rebuild. A model you switch to inside pi is
+kept until you choose another one in msbctl.
+
+A fixed `models = ["…"]` list in the table still works and is offered instead
+of the live one, but it is what goes stale. "Choose a model" offers to drop it.
+
 ## A provider pi knows
 
 ```toml
 [llm.router]
 provider = "openrouter"
-models = ["qwen/qwen3-coder"]     # optional: only picks the default
+default_model = "qwen/qwen3-coder"   # optional: without it, pi's default
 ```
 
 `provider` is one of `anthropic`, `openai`, `openrouter`, `google`, `mistral`,
@@ -85,7 +116,8 @@ models = ["qwen/qwen3-coder"]     # optional: only picks the default
 knows their models; msbctl knows their host, so the egress rule and the key
 binding come from the same table. Its key is `LLM_KEY_ROUTER`, not pi's usual
 `OPENROUTER_API_KEY`. msbctl points pi at its own variable. `base_url` sends a
-provider through a proxy of yours instead.
+provider through a proxy of yours instead. "Choose a model" lists the
+provider's models too, using its own key.
 
 ## Keys
 
