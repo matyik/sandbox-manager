@@ -157,6 +157,15 @@ class PiTest(MsbctlTest):
         self.assertEqual(settings, {"defaultProvider": "qwen", "defaultModel": "qwen-small",
                                     "theme": "light", "enableInstallTelemetry": False})
 
+    def test_a_model_the_endpoint_no_longer_lists_is_replaced(self):
+        self.config(QWEN)
+        self.make_folder_sandbox("web", sandbox_toml=PI_ON)
+        os.makedirs(os.path.dirname(self.agent_file("web", "settings.json")))
+        with open(self.agent_file("web", "settings.json"), "w", encoding="utf-8") as fh:
+            json.dump({"defaultProvider": "qwen", "defaultModel": "Qwen3.8"}, fh)
+        self.start()
+        self.assertEqual(self.agent_json("web", "settings.json")["defaultModel"], "qwen-coder")
+
     # ------------------------------------------------------------- refusals
 
     def test_endpoint_problems(self):

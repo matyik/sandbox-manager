@@ -2350,7 +2350,8 @@ def ensure_pi(box):
     agent/settings.json  MERGED: pi writes it too (the model you pick, the
                          theme). msbctl turns install telemetry off and points
                          the default at the first endpoint only while it names
-                         a provider the sandbox no longer has.
+                         a provider the sandbox no longer has, or a model your
+                         endpoint no longer lists.
     agent/AGENTS.md      OVERWRITTEN: the same managed text Claude gets as
                          CLAUDE.md, with this sandbox's section.
     """
@@ -2372,10 +2373,17 @@ def ensure_pi(box):
     # PI_OFFLINE in [agent_env.pi] already stops the ping; this is the switch
     # pi documents for it, so a run without that env stays quiet too.
     settings["enableInstallTelemetry"] = False
-    ours = [spec.get("provider") or name for name, spec in endpoints]
-    if ours and settings.get("defaultProvider") not in ours:
-        spec = endpoints[0][1]
-        settings["defaultProvider"] = ours[0]
+    ours = {spec.get("provider") or name: spec for name, spec in endpoints}
+    current = ours.get(settings.get("defaultProvider"))
+    # A model an endpoint of yours no longer lists is as stale as a provider
+    # the sandbox no longer has: pi would keep asking the server for it, and
+    # the server's "no such model" comes back as a bare "Connection error".
+    # A built-in provider's models are pi's to know, so its pick is kept.
+    stale_model = (current is not None and not current.get("provider")
+                   and settings.get("defaultModel") not in current["models"])
+    if ours and (current is None or stale_model):
+        pid, spec = next(iter(ours.items()))
+        settings["defaultProvider"] = pid
         if spec.get("models"):
             settings["defaultModel"] = spec["models"][0]
         else:
