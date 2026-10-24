@@ -8,9 +8,24 @@ release notes.
 
 ## [Unreleased]
 
-### Added
 - Published tcp ports are clickable in `msbctl port` and `show` (an OSC 8 hyperlink to `http://127.0.0.1:<host>/` on a terminal), and `show --json` adds a `port_urls` map of each port to its URL.
-- pi, a second coding agent for your own model server or any provider: add endpoints with `msbctl setup` → Model endpoints (HTTPS only, the key stays on the host), then tick `pi` under Coding agents and rebuild.
+
+## [0.8.0] - 2026-10-24
+
+### Added- Agent tools: a capability your own endpoints back (web search, page reading, anything else), attached to sandboxes from one folder — `~/.config/msb/tools/<name>/` with a `bundle.toml`, a pi extension and a Claude Code skill. Its egress rules and environment are emitted from the bundle, the adapters are installed at every start and removed when it goes, and `msbctl setup` → Agent tools turns them on for new sandboxes (`msbctl edit` for one). Nothing belongs in the project; see the docs site's "Agent tools" page.
+- A tool bundle can give pi a published pi package (`pi_package = "name"` or `"name@1.2.3"` in `bundle.toml`), such as `billion-context-pi`: msbctl declares it in pi's settings and pi installs it inside the sandbox on the next start, onto the mount that survives a rebuild; `msbctl update <name> -c pi` now also updates pi's packages (a pinned one stays).
+- Each sandbox now tells its agent where its project is mounted and where the project's own `.agents/skills/` folder is, so those files are reachable from outside it; nothing to do, it lands on the next start.
+- pi, a second coding agent for your own model server or any provider: add a source with `msbctl setup` → Model endpoints (a URL and a key; HTTPS only, the key stays on the host), pick its model from the list it serves, then tick `pi` under Coding agents and rebuild. The model list is asked again on every start, and "choose a model" changes the model without a rebuild.
+
+### Fixed
+- `msbctl secret add` no longer writes `secret_binds` into the middle of a multi-line `extra_rules` list, which left the file unreadable; the same fix covers `allow` after a multi-line `rule_groups` and `mount add`. A list holding an IPv6 rule (`allow@[fd00::1]:tcp:22`) is no longer cut short at its `]`, and msbctl now refuses to write a file it would leave invalid.
+- A policy change can no longer hide in the approval prompt: text from `.msb/sandbox.toml` that would move the cursor or recolour the terminal is shown escaped, so an `\u001b` sequence can't erase the added rule or secret binding from the screen you are approving.
+- `msbctl edit`, `allow` and `secret` no longer approve a change the sandbox wrote to `.msb/sandbox.toml` while they waited on you: only what msbctl itself wrote is approved unasked, and anything else (including your own edit in "Edit the files") is shown and asked about as you leave.
+- The `containers` rule group now allows `*.data.mcr.microsoft.com`, where Microsoft's registry actually serves image layers from, so pulling an `mcr.microsoft.com` image inside a sandbox no longer fails at the first layer; rebuild a sandbox with `containers` to pick it up.
+- pi no longer stops at a startup question nobody is there to answer. The sandbox's project folder (and `/tmp`) are trusted on every start, which also fixes the project's own `.agents/skills/` loading nothing when pi is started without a terminal (`msbctl exec . -- pi …`), where pi answered its own trust prompt with "no"; and the "What's New" block pi prints after it updates is switched off — `/changelog` still shows it. Both are pi's own settings under `~/.pi/agent/`, rewritten on every start, so nothing needs a rebuild.
+
+### Changed
+- pi installs from `@earendil-works/pi-coding-agent`: the `@mariozechner` package pi used to live in is deprecated on npm and stops at 0.73.1, so rebuild a sandbox that already has pi: its key stops working until then, because `models.json` now uses the key spelling only the new pi understands.
 
 ## [0.7.0] - 2026-10-22
 

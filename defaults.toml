@@ -102,6 +102,14 @@ private_dns_groups = []
 # default. `msbctl setup` → Model endpoints sets both.
 llm = []
 
+# The agent tool bundles (~/.config/msb/tools/<name>/, see
+# docs/content/agent-tools.md) every new sandbox gets. Ship empty on purpose:
+# a bundle names endpoints the operator runs and opens egress to them, so one
+# committed here would point every clone at someone else's server. Each brings
+# `allow@host:tcp:port` rules and its [env]; a registry entry overrides with
+# `tools = [...]`, and `msbctl setup` → Agent tools sets this.
+tools = []
+
 # "secret" — bind CLAUDE_CODE_OAUTH_TOKEN with --secret and give the sandbox
 #            its own ~/.claude. The real credential never enters the VM.
 # "mount"  — bind-mount the host's ~/.claude and ~/.claude.json. Shared
@@ -201,6 +209,12 @@ IS_SANDBOX = "1"
 # refused check only costs a startup delay. `msbctl update -c pi` is the
 # update path, as for Claude. msbctl also sets enableInstallTelemetry = false
 # in pi's settings.json.
+#
+# Since pi 1.x this also stops it fetching `fd` and `ripgrep` from GitHub
+# releases into ~/.pi/agent/bin when its grep and find tools cannot find them on
+# PATH — and those two tools refuse outright with neither a download nor a system
+# binary. Harmless here: both are in bootstrap.sh's base package list, which is
+# why pi's own downloader is not needed and can stay off.
 PI_OFFLINE = "1"
 
 # ---------------------------------------------------------------------------
@@ -211,8 +225,13 @@ PI_OFFLINE = "1"
 #
 #   [llm.qwen]
 #   base_url = "https://llm.home.example:8443/v1"   # https only (see below)
-#   models = ["Qwen3-Coder-Next"]                   # the first is pi's default
-#   context_window = 131072                         # optional, pi's default 128000
+#   default_model = "Qwen3-Coder-Next"              # the one pi starts with
+#   # models = ["Qwen3-Coder-Next"]   # a FIXED list. Without it (the usual
+#   #                                 # way) every start asks the server what it
+#   #                                 # serves now, and pi offers exactly that;
+#   #                                 # a fixed list is what goes stale.
+#   context_window = 131072           # optional: else what the server reports,
+#                                     # else pi's default 128000
 #   max_tokens = 32768                              # optional, pi's default 16384
 #   reasoning = false                               # optional
 #   api = "openai-completions"                      # the default; or
@@ -235,7 +254,14 @@ PI_OFFLINE = "1"
 #                                    # openrouter, google, mistral, groq,
 #                                    # deepseek, xai, cerebras, fireworks,
 #                                    # huggingface. pi knows its models.
-#   models = ["qwen/qwen3-coder"]    # optional: only picks the default
+#   default_model = "qwen/qwen3-coder"   # optional: else pi's default
+#
+# `msbctl setup` → Model endpoints works all of this out from a URL and a key:
+# it asks the server (OpenAI-style /v1/models or /models, then Anthropic's)
+# for the base URL, the API and the list to pick the model from, asks for a CA
+# only if the certificate is not trusted, and sets private_dns when the name
+# resolves to a LAN address. "Choose a model" changes the model later; that is
+# read on every start, so it needs no rebuild.
 #
 # The key is LLM_KEY_<NAME> (LLM_KEY_QWEN) in secrets/global.env, or in a
 # sandbox's own secrets/<name>.env, which wins. It is bound to that endpoint's
@@ -461,7 +487,11 @@ rust = [
 # refused" on production.cloudfront.docker.com. Codeberg's registry is
 # codeberg.org itself (Forgejo serves its packages and their blobs from the
 # same host). mcr.microsoft.com is where the devcontainers images (the default
-# image) come from. Add quay.io etc. as you need.
+# image) come from, and it has the same trap as Docker Hub: it answers the
+# registry API itself but 307-redirects every layer blob to a regional host,
+# <region>.data.mcr.microsoft.com (eastus.… when this was found; the region is
+# MCR's choice, so it is a wildcard). Without it the pull fails at the first blob with
+# an error naming only mcr.microsoft.com. Add quay.io etc. as you need.
 containers = [
     "allow@registry-1.docker.io:tcp:443",
     "allow@auth.docker.io:tcp:443",
@@ -471,6 +501,7 @@ containers = [
     "allow@pkg-containers.githubusercontent.com:tcp:443",
     "allow@codeberg.org:tcp:443",
     "allow@mcr.microsoft.com:tcp:443",
+    "allow@*.data.mcr.microsoft.com:tcp:443",
 ]
 
 go = [
