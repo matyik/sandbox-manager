@@ -29,7 +29,7 @@ class PortUrlTest(MsbctlTest):
         self.assertIsNone(self.m.port_url("127.0.0.1", 3000, "udp"))
 
     def test_url_unspecified_maps_to_its_own_loopback(self):
-        self.assertEqual(self.m.port_url("0.0.0.0", 8080, "tcp"),
+        self.assertEqual(self.m.port_url("0.0.0.0", 8080, "tcp"),  # noqa: S104 — a string, not a bind
                          "http://127.0.0.1:8080/")
         self.assertEqual(self.m.port_url("::", 8080, "tcp"),
                          "http://[::1]:8080/")
