@@ -48,7 +48,7 @@ fail=0
 # ---------------------------------------------------------------- step 1: pi
 say "1  the adapter under pi's own loader"
 
-PI_ROOT="$(npm root -g 2>/dev/null)/@mariozechner/pi-coding-agent"
+PI_ROOT="$(npm root -g 2>/dev/null)/@earendil-works/pi-coding-agent"
 LOADER="$PI_ROOT/dist/core/extensions/loader.js"
 [ -f "$LOADER" ] || { echo "   pi's extension loader not found at $LOADER"; exit 1; }
 

@@ -283,7 +283,18 @@ CLAUDE_SPEC = "CLAUDE_CODE_OAUTH_TOKEN@api.anthropic.com,platform.claude.com"
 # naming a host its key is sent to is exactly what the policy pin exists to
 # stop. A project only says whether pi is installed ([bootstrap] pi).
 
-PI_PACKAGE = "@mariozechner/pi-coding-agent"
+# The scope moved under pi. `@mariozechner/pi-coding-agent` is deprecated on npm
+# ("please use @earendil-works/pi-coding-agent instead going forward") and frozen
+# at 0.73.1, so `@latest` there is a dead end; the live package is
+# `@earendil-works/pi-coding-agent`. Moving is what lets a sandbox load anything
+# from the current pi ecosystem: pi resolves an extension's imports through an
+# alias map of scopes it bundles itself (dist/core/extensions/loader.js), and the
+# old scope aliases only `@mariozechner/*` — so a package compiled against
+# `@earendil-works/*` cannot load on 0.73. 1.x keeps the old names aliased too,
+# which is why msb-<bundle>.ts adapters are unaffected either way.
+# bootstrap.sh's do_pi gets it as MSB_PI_PACKAGE, so this is the one place it is
+# spelled. A guest still on the old scope is not migrated: rebuild it.
+PI_PACKAGE = "@earendil-works/pi-coding-agent"
 GUEST_PI_DIR = "/root/.pi"
 # msbctl's copy of a bundle adapter is prefixed — pi's extensions/msb-<name>.ts,
 # Claude's skills/msb-<name>/ — so it is a file msbctl owns and may delete again,
@@ -297,7 +308,8 @@ PI_APIS = ("openai-completions", "openai-responses", "anthropic-messages",
            "google-generative-ai")
 
 # pi's built-in API-key providers, by pi's own provider name: where pi sends
-# their requests (from @mariozechner/pi-ai 0.73), where they list their models,
+# their requests (from @earendil-works/pi-ai 1.4, host and provider id re-checked
+# against the provider list it ships), where they list their models,
 # and how that listing is authenticated. `provider = "<name>"` in an [llm]
 # table uses one: pi knows its models, msbctl knows its host. Each key is sent
 # as a header (Authorization, x-api-key or x-goog-api-key), which is what
@@ -336,6 +348,21 @@ def llm_key_var(name):
     for [llm.qwen]. Reserved (is_reserved_var), so no `secret_binds` entry can
     point the same value at another host."""
     return LLM_KEY_PREFIX + name.upper().replace("-", "_")
+
+
+def llm_key_ref(name):
+    """How pi's models.json points at an endpoint's key: `$LLM_KEY_<NAME>`.
+
+    The `$` is not decoration. pi >=1.0 interpolates only `$NAME`/`${NAME}` and
+    otherwise takes the value as the key itself, where 0.73 looked a bare name up
+    in the environment. Both halves were checked against a real request: each
+    version pointed at a local endpoint with each spelling, and the
+    `Authorization` header carried the value only for `$NAME` on 1.4 and the bare
+    name on 0.73. No spelling satisfies both, so msbctl writes what PI_PACKAGE
+    resolves; a guest left on 0.73 sends the literal `$LLM_KEY_…` and gets the 401
+    that names it — rebuild it.
+    """
+    return "$" + llm_key_var(name)
 
 
 def llm_url(spec):
@@ -794,9 +821,9 @@ def served_models(name, spec, key, timeout=8):
 
 def pi_models_json(endpoints):
     """~/.pi/agent/models.json for (name, spec, models) triples, `models` being
-    what served_models() found (None: unknown). Holds no secret: `apiKey`
-    NAMES the variable, which pi reads from its environment, where msb has put
-    the placeholder."""
+    what served_models() found (None: unknown). Holds no secret: `apiKey` is a
+    `$`-reference to the variable, which pi resolves from its environment, where
+    msb has put the placeholder (see llm_key_ref())."""
     providers = {}
     for name, spec, models in endpoints:
         url, _, _ = llm_url(spec)
@@ -804,10 +831,10 @@ def pi_models_json(endpoints):
             # A built-in: pi has its models already. What changes is where the
             # key is (msbctl's variable, not pi's usual one) and, with
             # base_url, where requests go.
-            providers[spec["provider"]] = {"baseUrl": url, "apiKey": llm_key_var(name)}
+            providers[spec["provider"]] = {"baseUrl": url, "apiKey": llm_key_ref(name)}
             continue
         entry = {"baseUrl": url, "api": spec.get("api", "openai-completions"),
-                 "apiKey": llm_key_var(name)}
+                 "apiKey": llm_key_ref(name)}
         # The `developer` role and `reasoning_effort` are OpenAI's own; vLLM,
         # llama.cpp, Ollama and SGLang reject or ignore them, which surfaces as
         # an empty or failed first turn. `compat` overrides either.
@@ -2933,8 +2960,9 @@ def ensure_pi(box):
                          server of yours, the models it serves NOW (asked from
                          here, else the last list; see served_models()), so
                          pi's /model offers exactly those. No secret in it —
-                         `apiKey` names LLM_KEY_<NAME>, whose value in the
-                         guest is msb's placeholder.
+                         `apiKey` is `$LLM_KEY_<NAME>` (llm_key_ref(): the
+                         `$` is required), whose value in the guest is msb's
+                         placeholder.
     agent/settings.json  MERGED: pi writes it too (the model you switch to,
                          the theme). msbctl turns install telemetry off and
                          sets the default model when the one chosen in msbctl
@@ -3846,6 +3874,7 @@ def bootstrap_payload(box):
         "MSB_WANT_CLAUDE": "0" if boot.get("claude") is False else "1",
         # Opt-in: it needs a model endpoint of this machine's to be any use.
         "MSB_WANT_PI": "1" if boot.get("pi") else "0",
+        "MSB_PI_PACKAGE": PI_PACKAGE,
         "MSB_WANT_BUN": "1" if boot.get("bun") else "0",
         "MSB_WANT_GITLEAKS": "1" if boot.get("gitleaks") else "0",
         "MSB_PROJECT_DIR": box.guest_project,
