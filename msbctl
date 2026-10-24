@@ -282,28 +282,39 @@ LLM_KEY_PREFIX = "LLM_KEY_"
 PI_APIS = ("openai-completions", "openai-responses", "anthropic-messages",
            "google-generative-ai")
 
-# pi's built-in API-key providers, by pi's own provider name, and where pi
-# sends their requests (from @mariozechner/pi-ai 0.73). `provider = "<name>"`
-# in an [llm] table uses one: pi knows its models, msbctl knows its host. Each
-# key is sent as a header (Authorization, x-api-key or x-goog-api-key), which
-# is what substitution needs. Only providers with one fixed host are here.
+# pi's built-in API-key providers, by pi's own provider name: where pi sends
+# their requests (from @mariozechner/pi-ai 0.73), where they list their models,
+# and how that listing is authenticated. `provider = "<name>"` in an [llm]
+# table uses one: pi knows its models, msbctl knows its host. Each key is sent
+# as a header (Authorization, x-api-key or x-goog-api-key), which is what
+# substitution needs. Only providers with one fixed host are here.
 PI_PROVIDERS = {
-    "anthropic":   "https://api.anthropic.com",
-    "openai":      "https://api.openai.com/v1",
-    "openrouter":  "https://openrouter.ai/api/v1",
-    "google":      "https://generativelanguage.googleapis.com/v1beta",
-    "mistral":     "https://api.mistral.ai",
-    "groq":        "https://api.groq.com/openai/v1",
-    "deepseek":    "https://api.deepseek.com",
-    "xai":         "https://api.x.ai/v1",
-    "cerebras":    "https://api.cerebras.ai/v1",
-    "fireworks":   "https://api.fireworks.ai/inference",
-    "huggingface": "https://router.huggingface.co/v1",
+    "anthropic":   ("https://api.anthropic.com", "https://api.anthropic.com/v1/models",
+                    "anthropic"),
+    "openai":      ("https://api.openai.com/v1", "https://api.openai.com/v1/models", "bearer"),
+    "openrouter":  ("https://openrouter.ai/api/v1", "https://openrouter.ai/api/v1/models",
+                    "bearer"),
+    "google":      ("https://generativelanguage.googleapis.com/v1beta",
+                    "https://generativelanguage.googleapis.com/v1beta/models", "google"),
+    "mistral":     ("https://api.mistral.ai", "https://api.mistral.ai/v1/models", "bearer"),
+    "groq":        ("https://api.groq.com/openai/v1", "https://api.groq.com/openai/v1/models",
+                    "bearer"),
+    "deepseek":    ("https://api.deepseek.com", "https://api.deepseek.com/models", "bearer"),
+    "xai":         ("https://api.x.ai/v1", "https://api.x.ai/v1/models", "bearer"),
+    "cerebras":    ("https://api.cerebras.ai/v1", "https://api.cerebras.ai/v1/models", "bearer"),
+    "fireworks":   ("https://api.fireworks.ai/inference",
+                    "https://api.fireworks.ai/inference/v1/models", "bearer"),
+    "huggingface": ("https://router.huggingface.co/v1", "https://router.huggingface.co/v1/models",
+                    "bearer"),
 }
 
 # The keys an [llm.<name>] table may have; anything else is a typo, refused.
-LLM_KEYS = ("provider", "base_url", "api", "models", "context_window", "max_tokens",
-            "reasoning", "private_dns", "ca_cert", "compat")
+LLM_KEYS = ("provider", "base_url", "api", "models", "default_model", "context_window",
+            "max_tokens", "reasoning", "private_dns", "ca_cert", "compat")
+
+# The models an endpoint served when msbctl last asked, per endpoint: what a
+# start falls back to when the server cannot be reached from here.
+LLM_CACHE_DIR = os.path.join(STATE_DIR, "llm")
 
 
 def llm_key_var(name):
@@ -315,7 +326,7 @@ def llm_key_var(name):
 
 def llm_url(spec):
     """(base_url, host, port) of an endpoint, its provider's URL if it names one."""
-    url = spec.get("base_url") or PI_PROVIDERS.get(spec.get("provider", ""), "")
+    url = spec.get("base_url") or PI_PROVIDERS.get(spec.get("provider", ""), ("",))[0]
     parsed = urllib.parse.urlsplit(url)
     return url, (parsed.hostname or ""), (parsed.port or 443)
 
@@ -357,8 +368,9 @@ def llm_problem(name, spec):
     models = spec.get("models", [])
     if not isinstance(models, list) or not all(isinstance(m, str) and m for m in models):
         return "models must be a list of model ids"
-    if not provider and not models:
-        return "needs at least one model id in `models`"
+    if "default_model" in spec and not (isinstance(spec["default_model"], str)
+                                        and spec["default_model"]):
+        return "default_model must be a model id"
     for key in ("context_window", "max_tokens"):
         if key in spec and (not isinstance(spec[key], int) or isinstance(spec[key], bool)
                             or spec[key] <= 0):
@@ -381,17 +393,176 @@ def llm_endpoints(config):
     return table if isinstance(table, dict) else {}
 
 
+def llm_default_model(spec):
+    """The model pi should start with: `default_model`, else the first of a
+    fixed `models` list, else None (the first the server lists)."""
+    return spec.get("default_model") or (spec.get("models") or [None])[0]
+
+
+# ------------------------------------------------------- what a server serves
+#
+# Models come and go on a server you run, so msbctl asks it: at `msbctl setup`
+# to offer a list to pick from, and on every start of a sandbox with pi, so
+# pi's /model shows what is served NOW. Asked from this machine, with the real
+# key (it never enters a sandbox anyway), through the endpoint's own CA if it
+# has one. A fixed `models` list in the table opts out of all of it.
+
+class LlmError(Exception):
+    """`kind` is "tls" (certificate not trusted), "auth" (key refused),
+    "absent" (no model list at that URL) or "unreachable"."""
+
+    def __init__(self, kind, message):
+        super().__init__(message)
+        self.kind = kind
+
+
+def _llm_context(ca_cert):
+    if not ca_cert:
+        return ssl.create_default_context()
+    return ssl.create_default_context(cafile=os.path.expanduser(ca_cert))
+
+
+def _llm_get(url, headers, ca_cert, timeout):
+    """GET a JSON document; LlmError on anything but a 2xx with JSON in it.
+    https only, like http_json(): urllib would as happily open file://."""
+    if not url.startswith("https://"):
+        raise LlmError("unreachable", f"{url} is not https")
+    req = urllib.request.Request(url, headers={"User-Agent": "msbctl", **headers})  # noqa: S310
+    try:
+        with urllib.request.urlopen(req, timeout=timeout,  # noqa: S310  checked above
+                                    context=_llm_context(ca_cert)) as resp:
+            return json.load(resp)
+    except urllib.error.HTTPError as exc:
+        kind = "auth" if exc.code in (401, 403) else "absent"
+        raise LlmError(kind, f"{url} answered {exc.code}") from None
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            raise LlmError("tls", f"{urllib.parse.urlsplit(url).hostname}'s certificate is "
+                                  f"not trusted here ({exc.reason.verify_message})") from None
+        raise LlmError("unreachable", f"{url}: {exc.reason}") from None
+    except (TimeoutError, OSError) as exc:
+        raise LlmError("unreachable", f"{url}: {exc}") from None
+    except ValueError:
+        raise LlmError("absent", f"{url} did not answer with JSON") from None
+
+
+def _auth_headers(auth, key):
+    if not key:
+        return {"anthropic-version": "2023-06-01"} if auth == "anthropic" else {}
+    if auth == "anthropic":
+        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if auth == "google":
+        return {"x-goog-api-key": key}
+    return {"Authorization": f"Bearer {key}"}
+
+
+def _parse_model_list(data):
+    """[{"id", "context"}] from an OpenAI-, Anthropic- or Google-style list,
+    or None if `data` is not a model list. `context` is whatever window the
+    server reports (vLLM, llama.cpp, OpenRouter and Google each say it their
+    own way), else None."""
+    items = data.get("data", data.get("models")) if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        mid = item.get("id") or item.get("name")
+        if not isinstance(mid, str) or not mid:
+            continue
+        methods = item.get("supportedGenerationMethods")
+        if isinstance(methods, list) and "generateContent" not in methods:
+            continue                    # a Google embedding model, not a chat one
+        context = (item.get("max_model_len") or item.get("context_length")
+                   or item.get("context_window") or item.get("inputTokenLimit")
+                   or (item.get("meta") or {}).get("n_ctx_train")
+                   or (item.get("top_provider") or {}).get("context_length"))
+        out.append({"id": mid.removeprefix("models/"),
+                    "context": context if isinstance(context, int) and context > 0 else None})
+    return out
+
+
+def fetch_llm_models(spec, key, timeout=8):
+    """The models an endpoint serves right now; LlmError if it cannot say."""
+    if spec.get("provider"):
+        _, url, auth = PI_PROVIDERS[spec["provider"]]
+    else:
+        base = llm_url(spec)[0].rstrip("/")
+        api = spec.get("api", "openai-completions")
+        if api == "anthropic-messages":
+            url, auth = base.removesuffix("/v1") + "/v1/models", "anthropic"
+        elif api == "google-generative-ai":
+            url, auth = base + "/models", "google"
+        else:
+            url, auth = base + "/models", "bearer"
+    models = _parse_model_list(_llm_get(url, _auth_headers(auth, key), spec.get("ca_cert"),
+                                        timeout))
+    if models is None:
+        raise LlmError("absent", f"{url} is not a model list")
+    return models
+
+
+def probe_llm_server(url, key, ca_cert=None, timeout=8):
+    """Find what a server is from the URL it was given, in whatever form:
+    (base_url, api, models). OpenAI-compatible first (vLLM, llama.cpp, Ollama,
+    LM Studio, LiteLLM all are), with and without /v1, then Anthropic's shape.
+    The first certificate or key refusal is raised as such: it is the answer,
+    and trying more paths would only bury it."""
+    url = url.strip().rstrip("/")
+    root = url.removesuffix("/v1")
+    tries = ([(url, "openai-completions")] if url.endswith("/v1") else
+             [(url + "/v1", "openai-completions"), (url, "openai-completions")])
+    tries.append((root, "anthropic-messages"))
+    refused = None
+    for base, api in tries:
+        try:
+            return base, api, fetch_llm_models({"base_url": base, "api": api,
+                                                "ca_cert": ca_cert}, key, timeout)
+        except LlmError as exc:
+            if exc.kind in ("tls", "unreachable"):
+                raise
+            if exc.kind == "auth":
+                refused = refused or exc
+    raise refused or LlmError("absent", f"found no model list at {url}, {url}/v1 or "
+                                        f"{root}/v1/models")
+
+
+def served_models(name, spec, key, timeout=8):
+    """(models, how): asked now ("live"), else the last answer ("cached",
+    with a warning), else (None, None). A fixed `models` list is taken as
+    given ("fixed"). Every live answer is cached."""
+    if spec.get("models"):
+        return [{"id": m, "context": None} for m in spec["models"]], "fixed"
+    cache = os.path.join(LLM_CACHE_DIR, f"{name}.json")
+    try:
+        models = fetch_llm_models(spec, key, timeout)
+    except LlmError as exc:
+        cached = read_json(cache).get("models")
+        if cached:
+            warn(f"{name}: could not ask for its models ({exc}) — using the list from "
+                 f"{read_json(cache).get('fetched', 'earlier')}")
+            return cached, "cached"
+        warn(f"{name}: could not ask for its models ({exc})")
+        return None, None
+    os.makedirs(LLM_CACHE_DIR, mode=0o700, exist_ok=True)
+    write_json(cache, {"fetched": dt.datetime.now(dt.timezone.utc)
+                       .strftime("%Y-%m-%dT%H:%M:%SZ"), "models": models})
+    return models, "live"
+
+
 def pi_models_json(endpoints):
-    """~/.pi/agent/models.json for these (name, spec) pairs. Holds no secret:
-    `apiKey` NAMES the variable, which pi reads from its environment, where
-    msb has put the placeholder."""
+    """~/.pi/agent/models.json for (name, spec, models) triples, `models` being
+    what served_models() found (None: unknown). Holds no secret: `apiKey`
+    NAMES the variable, which pi reads from its environment, where msb has put
+    the placeholder."""
     providers = {}
-    for name, spec in endpoints:
+    for name, spec, models in endpoints:
         url, _, _ = llm_url(spec)
         if spec.get("provider"):
-            # A built-in: pi has its models already, and `models` only picks
-            # the default. What changes is where the key is (msbctl's variable,
-            # not pi's usual one) and, with base_url, where requests go.
+            # A built-in: pi has its models already. What changes is where the
+            # key is (msbctl's variable, not pi's usual one) and, with
+            # base_url, where requests go.
             providers[spec["provider"]] = {"baseUrl": url, "apiKey": llm_key_var(name)}
             continue
         entry = {"baseUrl": url, "api": spec.get("api", "openai-completions"),
@@ -403,15 +574,22 @@ def pi_models_json(endpoints):
             entry["compat"] = {"supportsDeveloperRole": False, "supportsReasoningEffort": False}
         if "compat" in spec:
             entry["compat"] = {**entry.get("compat", {}), **spec["compat"]}
-        models = []
-        for model in spec["models"]:
-            m = {"id": model}
-            for key, pikey in (("context_window", "contextWindow"), ("max_tokens", "maxTokens"),
-                               ("reasoning", "reasoning")):
+        if models is None:
+            # The list could not be had, now or before: the chosen model alone,
+            # so pi can at least try it. A model the server has stopped
+            # serving is NOT added back — ensure_pi() warns about it instead.
+            default = llm_default_model(spec)
+            models = [{"id": default, "context": None}] if default else []
+        entry["models"] = []
+        for model in models:
+            m = {"id": model["id"]}
+            context = spec.get("context_window") or model.get("context")
+            if context:
+                m["contextWindow"] = context
+            for key, pikey in (("max_tokens", "maxTokens"), ("reasoning", "reasoning")):
                 if key in spec:
                     m[pikey] = spec[key]
-            models.append(m)
-        entry["models"] = models
+            entry["models"].append(m)
         providers[name] = entry
     return json.dumps({"providers": providers}, indent=2) + "\n"
 
@@ -2344,22 +2522,48 @@ def ensure_pi(box):
     The dir is the guest's ~/.pi, mounted, so no `msb exec` is involved and an
     edit to config.toml lands on the next start. Three files, three rules:
 
-    agent/models.json    OVERWRITTEN: the sandbox's [llm] endpoints, and nothing
-                         else. No secret in it — `apiKey` names LLM_KEY_<NAME>,
-                         whose value in the guest is msb's placeholder.
-    agent/settings.json  MERGED: pi writes it too (the model you pick, the
-                         theme). msbctl turns install telemetry off and points
-                         the default at the first endpoint only while it names
-                         a provider the sandbox no longer has.
+    agent/models.json    OVERWRITTEN: the sandbox's [llm] endpoints and, for a
+                         server of yours, the models it serves NOW (asked from
+                         here, else the last list; see served_models()), so
+                         pi's /model offers exactly those. No secret in it —
+                         `apiKey` names LLM_KEY_<NAME>, whose value in the
+                         guest is msb's placeholder.
+    agent/settings.json  MERGED: pi writes it too (the model you switch to,
+                         the theme). msbctl turns install telemetry off and
+                         sets the default model when the one chosen in msbctl
+                         changed since it last did, or when pi's names a
+                         provider or model that is no longer there.
     agent/AGENTS.md      OVERWRITTEN: the same managed text Claude gets as
                          CLAUDE.md, with this sandbox's section.
     """
     if not box.wants_component("pi"):
         return
-    endpoints = box.llms
+    own = read_env_file(os.path.join(SECRETS_DIR, f"{box.name}.env"))
+    shared = read_env_file(GLOBAL_ENV)
+    resolved, served, effective = [], {}, {}
+    for name, spec in box.llms:
+        pid = spec.get("provider") or name
+        models = None
+        if not spec.get("provider"):          # pi knows a provider's models itself
+            var = llm_key_var(name)
+            models, _ = served_models(name, spec, own.get(var) or shared.get(var), timeout=5)
+        resolved.append((name, spec, models))
+        wanted = llm_default_model(spec)
+        if models is not None:
+            ids = [m["id"] for m in models]
+            served[pid] = ids
+            if wanted and wanted not in ids:
+                warn(f"{name} no longer serves {wanted!r}"
+                     + (f" — pi starts with {ids[0]!r} instead" if ids else "")
+                     + ". Pick another: `msbctl setup` → Model endpoints → choose a model")
+                wanted = None
+            wanted = wanted or (ids[0] if ids else None)
+            if not ids:
+                warn(f"{name} serves no models right now")
+        effective[pid] = wanted
     agent = os.path.join(box.pi_state, "agent")
     os.makedirs(agent, mode=0o700, exist_ok=True)
-    _write_private(os.path.join(agent, "models.json"), pi_models_json(endpoints))
+    _write_private(os.path.join(agent, "models.json"), pi_models_json(resolved))
 
     path = os.path.join(agent, "settings.json")
     try:
@@ -2372,14 +2576,23 @@ def ensure_pi(box):
     # PI_OFFLINE in [agent_env.pi] already stops the ping; this is the switch
     # pi documents for it, so a run without that env stays quiet too.
     settings["enableInstallTelemetry"] = False
-    ours = [spec.get("provider") or name for name, spec in endpoints]
-    if ours and settings.get("defaultProvider") not in ours:
-        spec = endpoints[0][1]
-        settings["defaultProvider"] = ours[0]
-        if spec.get("models"):
-            settings["defaultModel"] = spec["models"][0]
-        else:
-            settings.pop("defaultModel", None)      # pi picks its provider's default
+    marker = os.path.join(agent, ".msbctl.json")
+    if effective:
+        pid = next(iter(effective))
+        desired = [pid, effective[pid]]
+        have = settings.get("defaultProvider"), settings.get("defaultModel")
+        # A model your server stopped serving is as stale as a provider the
+        # sandbox no longer has: pi would keep asking for it, and the server's
+        # "no such model" comes back as a bare "Connection error". A built-in
+        # provider's models are pi's to know, so its pick is never second-guessed.
+        valid = have[0] in effective and (have[0] not in served or have[1] in served[have[0]])
+        if desired != read_json(marker).get("applied") or not valid:
+            settings["defaultProvider"] = pid
+            if desired[1]:
+                settings["defaultModel"] = desired[1]
+            else:
+                settings.pop("defaultModel", None)  # pi picks its provider's default
+            write_json(marker, {"applied": desired})
     _write_private(path, json.dumps(settings, indent=2) + "\n")
 
     if assemble_profile():
@@ -2387,7 +2600,7 @@ def ensure_pi(box):
             text = fh.read()
         _write_private(os.path.join(agent, "AGENTS.md"),
                        text.rstrip("\n") + "\n\n" + sandbox_profile_section(box) + "\n")
-    if not endpoints:
+    if not resolved:
         warn(f"{box.name}: pi has no model endpoint — `msbctl setup` → Model endpoints, "
              f"then `msbctl edit {box.name}` → Models for pi")
 
@@ -5347,7 +5560,26 @@ def _summary_llms(config):
     if not table:
         return "none yet (pi needs one)"
     default = config.get("defaults", {}).get("llm", [])
-    return ", ".join(n + (" (default)" if n in default else "") for n in table)
+    return ", ".join(n + (f" ({llm_default_model(spec)})" if llm_default_model(spec) else "")
+                     + (" default" if n in default else "") for n, spec in table.items())
+
+
+API_LABELS = {"openai-completions": "OpenAI-compatible", "openai-responses": "OpenAI Responses",
+              "anthropic-messages": "Anthropic-compatible",
+              "google-generative-ai": "Google Generative AI"}
+
+
+def _llm_status(name, spec, key):
+    """One line on what an endpoint serves, asked now. Never raises."""
+    try:
+        ids = [m["id"] for m in fetch_llm_models(spec, key, timeout=5)]
+    except LlmError as exc:
+        return {"tls": "certificate not trusted here", "auth": "refused the key",
+                "absent": "lists no models", "unreachable": "unreachable from here"}[exc.kind]
+    want = llm_default_model(spec)
+    if want and want not in ids:
+        return f"{len(ids)} models served — {want!r} is NOT among them: choose a model"
+    return f"{len(ids)} models served" + (f", using {want!r}" if want else "")
 
 
 def section_llms(config, ctx):
@@ -5357,34 +5589,49 @@ def section_llms(config, ctx):
         table = llm_endpoints(config)
         default = list(config.get("defaults", {}).get("llm", []))
         say("Model endpoints")
-        note("Where pi sends its requests: your own server (vLLM, llama.cpp, Ollama, …")
-        note("anything OpenAI-compatible) or a provider pi knows. HTTPS only — the key")
-        note("stays on this machine and is swapped in on the way out, which needs TLS.")
-        note("Keys are stored 0600 in secrets/global.env as LLM_KEY_<NAME>.")
+        note("Where pi sends its requests: your own server (vLLM, llama.cpp, Ollama, …)")
+        note("or a provider pi knows. HTTPS only — the key stays on this machine and is")
+        note("swapped in on the way out, which needs TLS. Keys are stored 0600 in")
+        note("secrets/global.env as LLM_KEY_<NAME>. The models are asked from the source.")
+        # Asked all at once: each is a network round trip with its own timeout.
+        statuses = {}
+
+        def check(name, spec, key, into):
+            into[name] = _llm_status(name, spec, key)
+        threads = [threading.Thread(target=check, args=(n, sp, env.get(llm_key_var(n)), statuses),
+                                    daemon=True)
+                   for n, sp in table.items() if not llm_problem(n, sp)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(8)
         for name, spec in table.items():
             problem = llm_problem(name, spec)
             url, _, _ = llm_url(spec)
             key = "key stored" if env.get(llm_key_var(name)) else "no key"
-            models = ", ".join(spec.get("models", [])) or "(pi's own models)"
-            note(f"  {name:<12} {url}  {models}  {key}{'  (default)' if name in default else ''}")
+            note(f"  {name:<12} {url}  {key}{'  (default)' if name in default else ''}")
             if problem:
                 warn(f"[llm.{name}]: {problem}")
-        rows = ["add your own server", "add a provider pi knows (OpenRouter, OpenAI, …)"]
+            else:
+                note(f"  {'':<12} {statuses.get(name, 'no answer yet')}")
+        rows = ["add a model source"]
         if table:
-            rows += ["store or replace a key", "choose the defaults for new sandboxes", "remove one"]
+            rows += ["choose a model", "store or replace a key",
+                     "choose the defaults for new sandboxes", "remove one"]
         rows += ["back"]
         action = choose_one("model endpoints", rows, 0)
-        if action.startswith("add your"):
-            _add_llm(config, None)
-        elif action.startswith("add a"):
-            provider = choose_one("which", list(PI_PROVIDERS) + ["cancel"], 0)
-            if provider != "cancel":
-                _add_llm(config, provider)
+        if action.startswith("add"):
+            _add_llm(config)
+        elif action == "choose a model":
+            names = list(table)
+            name = names[0] if len(names) == 1 else choose_one("for", names + ["cancel"], 0)
+            if name != "cancel":
+                _choose_llm_model(name, table[name])
         elif action.startswith("store"):
             name = choose_one("key for", list(table) + ["cancel"], 0)
             if name != "cancel":
                 _store_llm_key(name)
-        elif action.startswith("choose"):
+        elif action.startswith("choose the defaults"):
             names = list(table)
             picked = toggle_list("defaults", names, [n for n in default if n in names])
             set_toml_key(CONFIG_FILE, "llm", picked, table="defaults")
@@ -5397,6 +5644,8 @@ def section_llms(config, ctx):
             if name in default:
                 set_toml_key(CONFIG_FILE, "llm", [n for n in default if n != name], table="defaults")
             set_env_file_value(GLOBAL_ENV, llm_key_var(name), None)
+            with contextlib.suppress(FileNotFoundError):
+                os.unlink(os.path.join(LLM_CACHE_DIR, f"{name}.json"))
             using = [n for n in registered()
                      if name in (read_toml(registry_path_for(n)).get("llm") or [])]
             note(f"removed {name} and its key"
@@ -5406,59 +5655,159 @@ def section_llms(config, ctx):
             return
 
 
-def _add_llm(config, provider):
-    """Ask for one [llm.<name>] table and write it, key by key, to config.toml."""
-    table = llm_endpoints(config)
-    name = ask("name for it (e.g. qwen)", provider or "").strip().lower()
-    if name in table:
-        warn(f"{name} exists already — remove it first")
+# Above this many, the list is narrowed by a filter first: OpenRouter alone
+# lists hundreds.
+MODEL_LIST_FILTER_AT = 15
+
+
+def pick_model(models, current=None, builtin=None):
+    """One model id from a server's list, or typed by hand (an id the list
+    does not show, or no list at all). `builtin` names a provider whose own
+    default can be chosen instead (returned as ""). None means cancelled."""
+    rows = []
+    shown = models
+    if len(models) > MODEL_LIST_FILTER_AT:
+        text = ask(f"{len(models)} models — part of the id to narrow it down (blank: all)").strip()
+        if text:
+            shown = [m for m in models if text.lower() in m["id"].lower()] or models
+            if shown is models:
+                note(f"nothing matches {text!r} — all of them, then")
+    for m in shown:
+        ctx_len = f"  {m['context'] // 1000}k context" if m.get("context") else ""
+        rows.append((f"{m['id']}{ctx_len}{'  (current)' if m['id'] == current else ''}", m["id"]))
+    if builtin:
+        rows.append((f"{builtin}'s own default (pi picks)", ""))
+    rows += [("type a model id", "type"), ("cancel", None)]
+    labels = [label for label, _ in rows]
+    start = next((i for i, (_, v) in enumerate(rows) if v == current), 0)
+    value = dict(rows)[choose_one("model", labels, start)]
+    if value == "type":
+        value = ask("model id, exactly as the server knows it", current or "").strip() or None
+    return value
+
+
+def _choose_llm_model(name, spec):
+    """Pick the model an endpoint is used with, from what it serves now."""
+    say(f"Model for {name}")
+    key = read_env_file(GLOBAL_ENV).get(llm_key_var(name))
+    try:
+        models = fetch_llm_models(spec, key)
+    except LlmError as exc:
+        warn(f"could not ask {name} for its models ({exc}) — you can still type one")
+        models = []
+    current = llm_default_model(spec)
+    if current and models and current not in [m["id"] for m in models]:
+        note(f"{current!r} is no longer served")
+    pick = pick_model(models, current, builtin=spec.get("provider"))
+    if pick is None or pick == (current or ""):
         return
-    spec = {}
+    set_toml_key(CONFIG_FILE, "default_model", pick or None, table=f"llm.{name}")
+    if spec.get("models"):
+        # A fixed list is what goes stale: offer the live one instead.
+        if confirm(f"[llm.{name}] has a fixed `models` list — offer pi whatever the "
+                   "server serves from now on instead?"):
+            set_toml_key(CONFIG_FILE, "models", None, table=f"llm.{name}")
+        elif pick and pick not in spec["models"]:
+            set_toml_key(CONFIG_FILE, "models", [pick, *spec["models"]], table=f"llm.{name}")
+    chosen = pick or f"{spec['provider']}'s own default"
+    note(f"{name} now uses {chosen}; sandboxes pick it up on their next start — no rebuild")
+
+
+def _resolves_privately(host):
+    """True if every address `host` resolves to here is private (a LAN or a
+    tailnet), which msb's DNS-rebind protection would drop."""
+    try:
+        addrs = {info[4][0] for info in socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)}
+    except OSError:
+        return False
+    return bool(addrs) and all(ipaddress.ip_address(a.split("%")[0]).is_private for a in addrs)
+
+
+def _add_llm(config):
+    """Ask for one model source and write it, key by key, to config.toml: a
+    server of yours is probed for what it is and where it lists its models,
+    and the model is picked from that list."""
+    table = llm_endpoints(config)
+    kinds = ["your own server (vLLM, llama.cpp, Ollama, LiteLLM, …)"] + list(PI_PROVIDERS)
+    kind = choose_one("what kind", kinds + ["cancel"], 0)
+    if kind == "cancel":
+        return
+    provider = None if kind == kinds[0] else kind
+    url = ""
+    if not provider:
+        url = ask("its URL (with or without /v1)").strip()
+        if url.startswith("http://"):
+            warn("it has to be https:// — the key can only be swapped in on a TLS connection")
+            return
+        if "://" not in url:
+            url = "https://" + url
+    host = urllib.parse.urlsplit(url).hostname or ""
+    suggested = provider or re.sub(r"[^a-z0-9-]", "-", host.split(".")[0].lower()).strip("-")
+    name = ask("name for it", suggested).strip().lower()
+    if name in table:
+        warn(f"{name} exists already — remove it first, or `choose a model` for it")
+        return
+    key = read_secret_hidden("its API key") or None
+    if key and any(c.isspace() for c in key):
+        warn("that key has whitespace in it — nothing was saved")
+        return
+
     if provider:
-        spec["provider"] = provider
-        model = ask(f"default model id (blank: pi's default for {provider})").strip()
-        if model:
-            spec["models"] = [model]
+        spec = {"provider": provider}
+        try:
+            models = fetch_llm_models(spec, key)
+        except LlmError as exc:
+            warn(f"could not list its models ({exc}) — you can still type one")
+            models = []
     else:
-        spec["base_url"] = ask("its base URL (e.g. https://llm.home.example/v1)").strip()
-        if urllib.parse.urlsplit(spec["base_url"]).path.strip("/") == "":
-            note("no path: OpenAI-compatible servers (vLLM, llama.cpp, Ollama) answer under /v1")
-            if confirm(f"use {spec['base_url'].rstrip('/')}/v1 instead?"):
-                spec["base_url"] = spec["base_url"].rstrip("/") + "/v1"
-        # Commas only: an id may contain spaces ("Qwen3.8 Flash Next"), exactly
-        # as the server lists it under /v1/models.
-        spec["models"] = [m.strip() for m in
-                          ask("model id(s) as /v1/models lists them, comma-separated, "
-                              "the first is the default").split(",") if m.strip()]
-        size = ask("context window in tokens (blank: pi's 128000)").strip()
-        if size:
-            if not size.isdigit():
-                warn("a number of tokens, like 131072")
-                return
-            spec["context_window"] = int(size)
+        ca, models = None, None
+        while models is None:
+            try:
+                base, api, models = probe_llm_server(url, key, ca)
+            except LlmError as exc:
+                warn(str(exc))
+                if exc.kind == "tls":
+                    raw = ask("the CA certificate that signed it, as a PEM file "
+                              "(blank to give up)").strip()
+                    if not raw:
+                        return
+                    ca = os.path.realpath(os.path.expanduser(raw))
+                    continue
+                rows = (["enter the key again"] if exc.kind == "auth" else []) + \
+                       ["save it anyway and type the model id", "cancel"]
+                choice = choose_one("then", rows, 0)
+                if choice == "cancel":
+                    return
+                if choice.startswith("enter"):
+                    key = read_secret_hidden("its API key") or None
+                    continue
+                base, api, models = url, "openai-completions", []
+        spec = {"base_url": base, "api": api}
+        if ca:
+            spec["ca_cert"] = ca
+        if models:
+            note(f"found an {API_LABELS[api]} server at {base}, serving {len(models)} model(s)")
+        if _resolves_privately(host):
+            note(f"{host} resolves to a private address: msb would drop that answer, so")
+            note("sandboxes using it get allow_private_dns (private_dns = true).")
+            spec["private_dns"] = True
+
+    pick = pick_model(models, builtin=provider)
+    if pick is None:
+        return
+    if pick:
+        spec["default_model"] = pick
     problem = llm_problem(name, spec)
     if problem:
         warn(problem)
         return
-    if not provider:
-        host = llm_url(spec)[1]
-        ca = ask("the CA certificate that signed its certificate, as a PEM file "
-                 "(blank if publicly trusted)").strip()
-        if ca:
-            spec["ca_cert"] = os.path.realpath(os.path.expanduser(ca))
-        if confirm(f"does {host} resolve to a PRIVATE (LAN) address?"):
-            note("msb drops such answers as DNS-rebind protection, so sandboxes using it")
-            note("get allow_private_dns — msbctl sets it for them automatically.")
-            spec["private_dns"] = True
-        problem = llm_problem(name, spec)
-        if problem:
-            warn(problem)
-            return
-    for key, value in spec.items():
-        set_toml_key(CONFIG_FILE, key, value, table=f"llm.{name}")
-    note(f"saved [llm.{name}] in {tilde(CONFIG_FILE)} (compat, api, max_tokens and reasoning "
+    for k, value in spec.items():
+        set_toml_key(CONFIG_FILE, k, value, table=f"llm.{name}")
+    note(f"saved [llm.{name}] in {tilde(CONFIG_FILE)} (compat, max_tokens and reasoning "
          "are there for hand-editing)")
-    _store_llm_key(name)
+    if key:
+        set_env_file_value(GLOBAL_ENV, llm_key_var(name), key)
+        note(f"stored {llm_key_var(name)}")
     default = list(config.get("defaults", {}).get("llm", []))
     if name not in default and confirm(f"give {name} to every NEW sandbox with pi?"):
         set_toml_key(CONFIG_FILE, "llm", default + [name], table="defaults")
@@ -6625,6 +6974,7 @@ def llm_rows(box):
         problem = "not defined in config.toml" if spec is None else llm_problem(name, spec)
         var = llm_key_var(name)
         rows.append({"name": name, "base_url": "" if problem else llm_url(spec)[0],
+                     "model": None if problem else llm_default_model(spec),
                      "key_stored": bool(own.get(var) or shared.get(var)),
                      "problem": problem})
     return rows
@@ -6716,6 +7066,7 @@ def cmd_show(args, config):
     note(f"autostart  {'yes' if box.autostart else 'no'}")
     for row in llm_rows(box):
         note(f"pi model   {row['name']:<10} {row['problem'] or row['base_url']}  "
+             f"{row['model'] or '(first served)'}  "
              f"{'key stored' if row['key_stored'] else 'no key'}")
     if box.containers_disk:
         note(f"containers {box.containers_disk} disk at /var/lib/containers")

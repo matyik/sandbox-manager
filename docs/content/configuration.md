@@ -100,9 +100,11 @@ check and install ping.
 
 ### `[llm.<name>]`
 
-A model endpoint for pi: `base_url` (HTTPS) and `models` for your own server,
-or `provider` for one pi knows, plus `context_window`, `max_tokens`,
-`reasoning`, `api`, `private_dns`, `ca_cert` and `compat`. None ship; `msbctl
+A model endpoint for pi: `base_url` (HTTPS) for your own server, or `provider`
+for one pi knows, and `default_model`, the model pi starts with. Without a
+fixed `models` list, pi is offered whatever the server serves at each start.
+Also `api`, `context_window`, `max_tokens`, `reasoning`, `private_dns`,
+`ca_cert` and `compat`. None ship; `msbctl
 setup` → "Model endpoints" writes them, and its key goes to `secrets/global.env`
 as `LLM_KEY_<NAME>`. See [Your own models](models.md).
 

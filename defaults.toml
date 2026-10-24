@@ -211,8 +211,13 @@ PI_OFFLINE = "1"
 #
 #   [llm.qwen]
 #   base_url = "https://llm.home.example:8443/v1"   # https only (see below)
-#   models = ["Qwen3-Coder-Next"]                   # the first is pi's default
-#   context_window = 131072                         # optional, pi's default 128000
+#   default_model = "Qwen3-Coder-Next"              # the one pi starts with
+#   # models = ["Qwen3-Coder-Next"]   # a FIXED list. Without it (the usual
+#   #                                 # way) every start asks the server what it
+#   #                                 # serves now, and pi offers exactly that;
+#   #                                 # a fixed list is what goes stale.
+#   context_window = 131072           # optional: else what the server reports,
+#                                     # else pi's default 128000
 #   max_tokens = 32768                              # optional, pi's default 16384
 #   reasoning = false                               # optional
 #   api = "openai-completions"                      # the default; or
@@ -235,7 +240,14 @@ PI_OFFLINE = "1"
 #                                    # openrouter, google, mistral, groq,
 #                                    # deepseek, xai, cerebras, fireworks,
 #                                    # huggingface. pi knows its models.
-#   models = ["qwen/qwen3-coder"]    # optional: only picks the default
+#   default_model = "qwen/qwen3-coder"   # optional: else pi's default
+#
+# `msbctl setup` → Model endpoints works all of this out from a URL and a key:
+# it asks the server (OpenAI-style /v1/models or /models, then Anthropic's)
+# for the base URL, the API and the list to pick the model from, asks for a CA
+# only if the certificate is not trusted, and sets private_dns when the name
+# resolves to a LAN address. "Choose a model" changes the model later; that is
+# read on every start, so it needs no rebuild.
 #
 # The key is LLM_KEY_<NAME> (LLM_KEY_QWEN) in secrets/global.env, or in a
 # sandbox's own secrets/<name>.env, which wins. It is bound to that endpoint's
